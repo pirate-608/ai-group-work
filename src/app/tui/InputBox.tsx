@@ -17,9 +17,11 @@ export function InputBox({
   onSubmit,
   lastInput,
 }: InputBoxProps): JSX.Element {
-  const [value, setValue] = useState("");
-  const [cursorPos, setCursorPos] = useState(0);
+  const [state, setState] = useState({ value: "", cursorPos: 0 });
   const [selectedIndex, setSelectedIndex] = useState(0);
+
+  const value = state.value;
+  const cursorPos = state.cursorPos;
 
   const commandSuggestions = useMemo(() => {
     return filterSlashCommands(value, commands).slice(0, MAX_VISIBLE_COMMANDS);
@@ -28,8 +30,7 @@ export function InputBox({
   const showCommandSuggestions = !disabled && value.startsWith("/");
 
   function updateValue(nextValue: string, nextCursor?: number): void {
-    setValue(nextValue);
-    setCursorPos(nextCursor ?? nextValue.length);
+    setState({ value: nextValue, cursorPos: nextCursor ?? nextValue.length });
     setSelectedIndex(0);
   }
 
@@ -65,37 +66,36 @@ export function InputBox({
       // ── Cursor movement ────────────────────────────
 
       if (key.leftArrow) {
-        setCursorPos(Math.max(0, cursorPos - 1));
+        setState((prev) => ({ ...prev, cursorPos: Math.max(0, prev.cursorPos - 1) }));
         return;
       }
 
       if (key.rightArrow) {
-        setCursorPos(Math.min(value.length, cursorPos + 1));
+        setState((prev) => ({ ...prev, cursorPos: Math.min(prev.value.length, prev.cursorPos + 1) }));
         return;
       }
 
       // Ctrl+A — move to start of line
       if (key.ctrl && (input === "a" || input === "A")) {
-        setCursorPos(0);
+        setState((prev) => ({ ...prev, cursorPos: 0 }));
         return;
       }
 
       // Ctrl+E — move to end of line
       if (key.ctrl && (input === "e" || input === "E")) {
-        setCursorPos(value.length);
+        setState((prev) => ({ ...prev, cursorPos: prev.value.length }));
         return;
       }
 
       // Ctrl+K — delete from cursor to end of line
       if (key.ctrl && (input === "k" || input === "K")) {
-        setValue(value.slice(0, cursorPos));
+        setState((prev) => ({ value: prev.value.slice(0, prev.cursorPos), cursorPos: prev.cursorPos }));
         return;
       }
 
       // Ctrl+U — delete from start to cursor
       if (key.ctrl && (input === "u" || input === "U")) {
-        setValue(value.slice(cursorPos));
-        setCursorPos(0);
+        setState((prev) => ({ value: prev.value.slice(prev.cursorPos), cursorPos: 0 }));
         return;
       }
 
@@ -132,25 +132,37 @@ export function InputBox({
       // ── Delete operations ──────────────────────────
 
       if (key.backspace) {
-        if (cursorPos > 0) {
-          setValue(value.slice(0, cursorPos - 1) + value.slice(cursorPos));
-          setCursorPos(cursorPos - 1);
-        }
+        setState((prev) => {
+          if (prev.cursorPos === 0) return prev;
+          return {
+            value: prev.value.slice(0, prev.cursorPos - 1) + prev.value.slice(prev.cursorPos),
+            cursorPos: prev.cursorPos - 1,
+          };
+        });
         return;
       }
 
       if (key.delete) {
-        if (cursorPos < value.length) {
-          setValue(value.slice(0, cursorPos) + value.slice(cursorPos + 1));
-        }
+        setState((prev) => {
+          if (prev.cursorPos >= prev.value.length) return prev;
+          return {
+            value: prev.value.slice(0, prev.cursorPos) + prev.value.slice(prev.cursorPos + 1),
+            cursorPos: prev.cursorPos,
+          };
+        });
         return;
       }
 
       // ── Regular text input ─────────────────────────
 
       if (!key.ctrl && !key.meta && input) {
-        setValue(value.slice(0, cursorPos) + input + value.slice(cursorPos));
-        setCursorPos(cursorPos + input.length);
+        setState((prev) => {
+          const chars = input;
+          return {
+            value: prev.value.slice(0, prev.cursorPos) + chars + prev.value.slice(prev.cursorPos),
+            cursorPos: prev.cursorPos + chars.length,
+          };
+        });
       }
     },
     { isActive: !disabled },
