@@ -1,0 +1,637 @@
+%!TEX program = xelatex
+\documentclass[12pt,a4paper]{ctexart}
+
+% ── Packages ──────────────────────────────────────
+\usepackage{geometry}
+\geometry{left=2.5cm,right=2.5cm,top=2.5cm,bottom=2.5cm}
+
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{listings}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes, fit, backgrounds}
+
+% Code listing style
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  showstringspaces=false,
+  tabsize=2,
+  language=Python,
+  captionpos=b,
+}
+
+% Custom colors
+\usepackage{xcolor}
+\definecolor{reactcolor}{RGB}{41,128,185}
+\definecolor{toolcolor}{RGB}{231,76,60}
+\definecolor{textcolor}{RGB}{46,204,113}
+\definecolor{obsercolor}{RGB}{155,89,182}
+
+\title{\textbf{基于 ReAct 范式与多厂商适配的 AI Agent 框架}}
+\author{blackpearl-agent 开发小组}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+  本报告介绍了一个完整的 TypeScript AI Agent 框架 \texttt{blackpearl-agent} 的设计与实现。
+  该框架基于 ReAct（Reasoning + Acting）范式，支持 OpenAI、Gemini、Claude、DeepSeek 和
+  Ollama 五类大语言模型后端，实现了工具调用循环、多 Agent 协作、流式输出、长期记忆、
+  技能系统及 MCP 协议扩展。项目完全手工编码，不依赖 LangChain 等高层框架，
+  所有核心决策闭环和工具调度逻辑均在源码中可追溯。本文详细阐述了 ReAct
+  提示词模版的设计、Agent 决策闭环流程、工程模块化实现，以及多步推理实验结果分析。
+
+  \textbf{关键词：} ReAct；AI Agent；Function Calling；多厂商适配；工具调用
+\end{abstract}
+
+\newpage
+\tableofcontents
+\newpage
+
+% ════════════════════════════════════════════════════════════════
+\section{核心原理与算法设计}
+% ════════════════════════════════════════════════════════════════
+
+\subsection{ReAct 范式的理论基础}
+
+ReAct（Reasoning + Acting）范式由 Yao 等人于 2023 年提出，其核心思想是将大语言模型的
+``思考''（Reasoning）与``行动''（Acting）交叠进行，形成一个闭环决策循环：
+
+\begin{enumerate}[label=(\arabic*)]
+  \item \textbf{Thought（思考）}：模型分析当前状态，决定是否需要调用工具
+  \item \textbf{Action（行动）}：模型生成结构化的工具调用指令
+  \item \textbf{Observation（观察）}：环境执行工具并将结果返回给模型
+  \item 模型基于观察继续推理，重复上述过程直到给出最终回答
+\end{enumerate}
+
+与传统的 Chain-of-Thought（CoT）相比，ReAct 的关键优势在于\textbf{将外部知识检索嵌入推理链条}，
+使模型能够获取训练数据之外的事实信息，同时通过工具执行精确的数学计算。
+
+\subsection{System Prompt 设计}
+
+System Prompt 是控制 Agent 行为的核心机制。本项目设计的 System Prompt 包含以下关键约束：
+
+\begin{lstlisting}[caption={Agent System Prompt（英文原文）}, label={lst:prompt}]
+You are blackpearl-agent, a terminal coding assistant.
+You run in a terminal workspace and help with file manipulation,
+shell commands, calculations, factual research, and code editing.
+
+Guidelines:
+- Use tools when the task requires calculation, factual lookup,
+  or local file access.
+- Never invent tool results. If a tool is needed, call it.
+- Keep tool arguments valid according to the provided schemas.
+- After tool use, explain the result briefly and cite the key
+  tool observation.
+- When editing files, prefer small, targeted edits over full
+  rewrites.
+- Do not run destructive commands. Always confirm sensitive
+  operations.
+
+Workflow for coding tasks:
+1. Read the relevant files first to understand the context.
+2. Make the minimal edit required.
+3. Verify the result by checking the edited file or
+   running tests.
+\end{lstlisting}
+
+该 Prompt 实现了三个控制目标：
+
+\begin{itemize}
+  \item \textbf{工具决策}：通过语义理解判断何时需要调用工具，而非硬编码规则——模型在遇到计算、
+    事实查询或文件操作时自主决定调用哪些工具
+  \item \textbf{格式约束}：通过 Zod Schema 将工具参数转换为 JSON Schema 传给模型，
+    确保参数类型安全（例如 calculator 的 expression 必须为 string）
+  \item \textbf{行为边界}：通过``never invent tool results''规则防止模型幻觉出虚假结果；
+    ``small, targeted edits''约束减少意外修改
+\end{itemize}
+
+\subsection{多 Agent Prompt 设计}
+
+在多 Agent 协作模式下，Planning Agent 和 Execution Agent 使用独立的 Prompt：
+
+\begin{lstlisting}[caption={Planning Agent 的 Prompt}, label={lst:plan}]
+You are a task planner. Break down the user's request into
+a list of steps.
+Output format: a JSON array of step description strings.
+  ["Step 1", "Step 2", ...]
+
+Rules:
+- Each step should be a self-contained, atomic instruction.
+- Steps should be executed sequentially—later steps may
+  depend on results of earlier steps.
+- Output ONLY the JSON array. No other text.
+- Do NOT call any tools. You only produce the plan.
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Execution Agent 的 Prompt}, label={lst:exec}]
+You are a task executor. Execute the given step using
+available tools.
+
+Context: you are working on step [N] of a multi-step plan.
+Previous results may be provided as context.
+- Execute the step precisely as described.
+- Use tools when needed.
+- Report the result clearly.
+- If a tool fails, note the error and try an alternative.
+\end{lstlisting}
+
+\subsection{Agent 决策闭环流程图}
+
+图\ref{fig:react} 展示了单 Agent 的完整 ReAct 决策闭环。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+      node distance=1.8cm,
+      box/.style={
+        rectangle, draw, rounded corners, minimum
+        width=3.5cm, minimum height=0.8cm,
+        align=center, font=\small
+      },
+      decision/.style={
+        diamond, draw, aspect=2, minimum width=2cm, minimum
+        height=0.8cm,
+        align=center, font=\footnotesize
+      },
+      arrow/.style={-{Stealth}, thick},
+      label/.style={font=\footnotesize\itshape}
+    ]
+
+    % Nodes
+    \node[box, fill=blue!10] (input) {用户输入};
+    \node[box, fill=green!10, below=of input] (prepare)
+    {构造上下文\\（记忆 + 技能匹配）};
+    \node[box, fill=yellow!10, below=of prepare] (llmcall)
+    {调用 LLM\\（流式输出）};
+    \node[decision, below=of llmcall] (hastool) {是否返回\\工具调用？};
+    \node[box, fill=red!10, right=of hastool, xshift=2cm]
+    (execute) {执行工具\\（Zod 参数校验 \\ $\to$ 执行 $\to$ 捕获结果）};
+    \node[box, fill=red!10, below=of execute] (feedback)
+    {将工具结果\\回传模型};
+    \node[box, fill=cyan!10, below=of hastool,
+    yshift=-0.5cm] (output) {输出最终回答};
+    \node[box, fill=gray!10, below=of output] (persist) {持久化：转录 + 记忆};
+
+    % Arrows
+    \draw[arrow] (input) -- (prepare);
+    \draw[arrow] (prepare) -- (llmcall);
+    \draw[arrow] (llmcall) -- (hastool);
+    \draw[arrow] (hastool) -- node[above, label] {是} (execute);
+    \draw[arrow] (execute) -- (feedback);
+    \draw[arrow, dashed] (feedback.east) -- ++(0.8,0) |-
+    (llmcall.east) node[pos=0.25, right, label] {循环};
+    \draw[arrow] (hastool) -- node[right, label] {否} (output);
+    \draw[arrow] (output) -- (persist);
+
+    % Annotations
+    \node[right=0.3cm of execute, font=\footnotesize, text
+    width=3cm] {
+      \texttt{tool\_call\_started} \\
+      \texttt{tool\_call\_finished}
+    };
+    \node[left=0.3cm of llmcall, font=\footnotesize, text
+    width=2.5cm, align=right] {
+      \texttt{assistant\_delta} \\
+      增量流式输出
+    };
+
+  \end{tikzpicture}
+  \caption{单 Agent ReAct 决策闭环流程图}
+  \label{fig:react}
+\end{figure}
+
+图\ref{fig:multiagent} 展示了多 Agent 协作模式的 Plan-Execute-Summarize 三阶段流程。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+      node distance=1.5cm,
+      box/.style={
+        rectangle, draw, rounded corners, minimum
+        width=3cm, minimum height=0.8cm,
+        align=center, font=\small
+      },
+      arrow/.style={-{Stealth}, thick},
+      phase/.style={font=\small\bfseries, text=blue!60!black}
+    ]
+
+    \node[box, fill=blue!10] (input) {用户请求};
+    \node[phase, right=0.5cm of input] (p1) {Phase 1};
+    \node[box, fill=yellow!10, below=of input] (planner)
+    {Planning Agent\\(无工具，$maxSteps=1$)};
+    \node[box, fill=yellow!10, below=of planner] (planout)
+    {输出：JSON 步骤数组\\\texttt{[``Step 1'', ``Step 2'', ...]}};
+
+    \node[phase, right=0.5cm of planout] (p2) {Phase 2};
+    \node[box, fill=red!10, below=of planout] (exec)
+    {Execution Agent\\(完整工具集，逐步执行)};
+    \node[box, fill=red!10, below=of exec] (steps)
+    {每步：上一步结果作为上下文 \\ $\to$ 调用工具 $\to$ 记录结果};
+
+    \node[phase, right=0.5cm of steps] (p3) {Phase 3};
+    \node[box, fill=green!10, below=of steps] (summarize)
+    {Summary Agent\\(无工具，$maxSteps=1$)};
+    \node[box, fill=green!10, below=of summarize] (final)
+    {合并所有步骤结果\\输出最终回答};
+
+    \draw[arrow] (input) -- (planner);
+    \draw[arrow] (planner) -- (planout);
+    \draw[arrow] (planout) -- (exec);
+    \draw[arrow] (exec) -- (steps);
+    \draw[arrow] (steps) -- (summarize);
+    \draw[arrow] (summarize) -- (final);
+
+  \end{tikzpicture}
+  \caption{多 Agent 协作 Plan-Execute-Summarize 流程图}
+  \label{fig:multiagent}
+\end{figure}
+
+\newpage
+% ════════════════════════════════════════════════════════════════
+\section{工程实现细节}
+% ════════════════════════════════════════════════════════════════
+
+\subsection{整体架构}
+
+项目采用分层设计，TUI / Web 入口共享同一套后端组装逻辑。
+图\ref{fig:arch} 展示了整体模块架构。
+
+\begin{figure}[H]
+  \centering
+  \begin{tikzpicture}[
+      node distance=1.2cm,
+      layer/.style={
+        rectangle, draw, rounded corners, minimum
+        width=8cm, minimum height=0.8cm,
+        align=center, font=\footnotesize, fill=#1
+      },
+      arrow/.style={-{Stealth}, thick}
+    ]
+
+    \node[layer=blue!10] (tui) {TUI / Web UI 层（Ink React + HTTP SSE）};
+    \node[layer=green!10, below=of tui] (orchestrator)
+    {编排层：AgentOrchestrator（单 Agent）+ MultiAgentOrchestrator（多 Agent）};
+    \node[layer=yellow!10, below=of orchestrator] (runner)
+    {运行层：ResponseRunner / ChatCompletionsRunner / ClaudeRunner};
+    \node[layer=red!10, below=of runner] (tools)
+    {工具层：Calculator + Baidu/Wiki Search + File I/O + Shell + MCP};
+    \node[layer=purple!10, below=of tools] (memory)
+    {存储层：TranscriptStore（JSONL）+ MemoryStore（关键词检索）};
+
+    \draw[arrow] (tui) -- (orchestrator);
+    \draw[arrow] (orchestrator) -- (runner);
+    \draw[arrow] (runner) -- (tools);
+    \draw[arrow] (tools) -- (memory);
+
+    % Side annotations
+    \node[right=0.3cm of orchestrator, font=\footnotesize,
+    text width=4.5cm] {
+      SkillRegistry：关键词匹配\\
+      EventBus：事件驱动通信\\
+      AbortController：可中断执行
+    };
+
+  \end{tikzpicture}
+  \caption{系统整体模块架构图}
+  \label{fig:arch}
+\end{figure}
+
+\subsection{核心模块说明}
+
+\subsubsection{(1) 工具注册表 —— ToolRegistry}
+
+\texttt{src/tools/registry.ts} 实现工具的统一注册、查询和执行。
+\texttt{createToolDefinition()} 工厂函数将 Zod 输入 Schema 编译为 JSON Schema 7，
+传递给 LLM 作为工具参数描述。核心方法：
+
+\begin{itemize}
+  \item \texttt{register(tool)}：注册标准 Zod 工具，重复名称报错
+  \item \texttt{registerMcpTool(tool)}：注册 MCP 工具，允许覆盖（支持重连场景）
+  \item \texttt{execute(name, input)}：查找工具 $\to$ Zod 参数校验
+    $\to$ 调用执行函数 $\to$ 返回结果
+  \item \texttt{getOpenAITools()} /
+    \texttt{getClaudeTools()}：将内部 ToolDefinition 格式转换为对应 API 的工具声明
+\end{itemize}
+
+\subsubsection{(2) 路径安全层 —— path-safety.ts}
+
+所有文件工具共享的安全约束核心：
+
+\begin{itemize}
+  \item \texttt{resolveWorkspacePath}：将请求路径解析到工作区根目录内，拒绝
+    \texttt{../} 路径逃逸
+  \item \texttt{assertReadableWorkspacePath}：阻止访问
+    \texttt{.git/}、\texttt{.blackpearl/}、\texttt{.env} 等敏感路径
+  \item \texttt{assertWritableWorkspacePath}：额外阻止写入
+    \texttt{node\_modules/}、\texttt{dist/}、\texttt{.venv/}
+  \item \texttt{shellCommandTool}：阻止任何包含
+    \texttt{|}、\texttt{\&}、\texttt{>} 的 shell 操作符，阻止
+    \texttt{rm}、\texttt{sudo} 等危险命令
+\end{itemize}
+
+\subsubsection{(3) Runner 三层实现}
+
+三种 Runner 均实现 \texttt{AgentRunner}
+接口（\verb|run(userInput, emit, options?) -> Promise<string>|），
+核心循环结构一致：
+
+\begin{lstlisting}[caption={Runner 核心循环伪代码}, label={lst:loop}]
+for step = 0..maxSteps:
+    if signal.aborted: throw AgentAbortedError
+
+    // 1. 调用 LLM（流式）
+    response = await callLLM(messages, tools, instructions)
+    // 每个 delta 增量: emit(assistant_delta)
+
+    // 2. 无工具调用 → 输出最终回答
+    if no tool_calls in response:
+        emit(assistant_message)
+        return response.text
+
+    // 3. 执行工具
+    for each tool_call:
+        emit(tool_call_started)
+        result = toolRegistry.execute(tool_call.name, tool_call.args)
+        emit(tool_call_finished)
+        append tool_result to messages
+
+// 超限
+throw AgentError("exceeded max steps")
+\end{lstlisting}
+
+三种 Runner 的关键差异见表\ref{tab:runners}。
+
+\begin{table}[H]
+  \centering
+  \caption{三种 Runner 实现对比}
+  \label{tab:runners}
+  \begin{tabular}{@{}p{2.5cm}p{3.5cm}p{3.5cm}p{3.5cm}@{}}
+    \toprule
+    \textbf{特性} & \textbf{ResponseRunner} &
+    \textbf{ChatCompletionsRunner} & \textbf{ClaudeRunner} \\
+    \midrule
+    适用模型 & OpenAI GPT-4.1+ & OpenAI, Gemini, Ollama &
+    Claude, DeepSeek \\
+    API 协议 & Responses API & Chat Completions API & Messages API \\
+    对话管理 & \texttt{previous\_response\_id} &
+    \texttt{messages[]} 数组 & \texttt{messages[]} 数组 \\
+    工具格式 & \texttt{function\_call\_output} & \texttt{role:
+    "tool"} & \texttt{tool\_result} \\
+    流式 delta & \texttt{output\_text.delta} &
+    \texttt{delta.content} & \texttt{content\_block\_delta} \\
+    工具参数流式 & 完整对象 & 按索引组装 & JSON 字符串拼接后 parse \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsubsection{(4) 百度百科搜索与模糊匹配}
+
+\texttt{baidu-search.ts} 是国内网络环境下最常用的搜索工具。为解决模型传入冗长查询
+（如``迈克尔杰克逊 出生年份 死亡年份''）导致的百度 API 无匹配问题，
+工具实现了三级自动回退策略：
+
+\begin{enumerate}
+  \item \textbf{关键词清洗}：通过正则去除``出生年份''``生平信息''``公司''等噪声词，
+    从``迈克尔杰克逊 出生年份 死亡年份''提取出``迈克尔杰克逊''
+  \item \textbf{变体生成}：对中文译名自动尝试加/去中圆点（``迈克尔杰克逊'' $\to$ ``迈克尔·杰克逊''）
+  \item \textbf{fuse.js 模糊匹配}：维护内存中的成功词条缓存，当查询失败时用 Fuse.js 模糊匹配历史缓存
+\end{enumerate}
+
+最多重试 4 次，每次重试使用不同的候选关键词，直到找到匹配或全部失败。
+
+\subsubsection{(5) 多 Agent 编排器}
+
+\texttt{MultiAgentOrchestrator} 实现了三阶段 Plan-Execute-Summarize 流程：
+
+\begin{itemize}
+  \item \textbf{Planning 阶段}：调用 Subagent Runner，注入
+    \texttt{PLANNER\_PROMPT} 作为指令，
+    禁用所有工具，设置 $maxSteps=1$。返回的纯文本通过 \texttt{parsePlan()}
+    解析为 JSON 步骤数组。
+    如 LLM 未返回有效 JSON，则尝试按数字编号行解析，最后回退为单一步骤。
+  \item \textbf{Execution 阶段}：按顺序迭代步骤。每个步骤调用 Subagent Runner 并注入
+    \texttt{EXECUTOR\_PROMPT}。上一步的执行结果通过
+    \texttt{buildStepContext()} 拼接为后续步骤的上下文。
+    此阶段有完整的工具访问权限。
+  \item \textbf{Summary 阶段}：将所有步骤和结果合并，调用 Subagent
+    Runner（无工具，$maxSteps=1$）
+    生成连贯的最终回答。
+\end{itemize}
+
+\subsection{关键数据处理}
+
+\begin{itemize}
+  \item \textbf{短期记忆}：从 AgentSession 的 messages 数组中取最近 8 条消息，直接拼入上下文
+  \item \textbf{长期记忆}：从 \texttt{.blackpearl/memory.jsonl}
+    读取所有记录，通过关键词提取
+    （分词、去停用词、去重）后计算匹配分数（每个匹配关键词 +3，摘要包含 +1），返回 Top-N
+  \item \textbf{会话转录}：每次 Agent 执行的所有事件（用户消息、工具调用、助手回答）以 JSONL
+    格式追加写入 \verb|.agent-sessions/<sessionId>.jsonl|
+  \item \textbf{技能匹配}：基于关键词得分（输入中的单词在技能描述中出现），无需 LLM 调用，
+    匹配到的技能指令和允许工具列表通过 RunOptions 注入下一次 LLM 调用
+\end{itemize}
+
+\newpage
+% ════════════════════════════════════════════════════════════════
+\section{实验结果与分析}
+% ════════════════════════════════════════════════════════════════
+
+\subsection{实验环境}
+
+\begin{itemize}
+  \item 运行环境：Node.js 24.13.0 + TypeScript 5.7（源码模式）；Node.js
+    26.3.0（SEA 独立可执行文件模式）
+  \item LLM 后端：DeepSeek V4 Pro（通过 Anthropic-compatible
+    API），$maxSteps=6$
+  \item
+    工具集：calculator、wiki\_search、baidu\_search、file\_read、file\_write、
+    file\_edit、file\_list、file\_search、shell\_command
+  \item 测试终端：Windows 11 Pro + WSL (Ubuntu)
+\end{itemize}
+
+\subsection{实验一：单步工具调用——百科查询 + 计算}
+
+\textbf{用户输入：}``查一下爱因斯坦的出生年份，然后计算他活了多少岁''
+
+\textbf{Agent 执行过程（关键步骤日志）：}
+
+\begin{lstlisting}[caption={Agent 多步推理完整日志}, label={lst:log}, basicstyle=\ttfamily\footnotesize]
+[user] 查一下爱因斯坦的出生年份，然后计算他活了多少岁
+
+// Step 1: Agent 判断需要先查百科
+[tool_call_started] wiki_search
+  args: {"query": "Albert Einstein", "lang": "zh"}
+[tool_call_finished] wiki_search (elapsed: 847ms)
+  result: { "found": true,
+    "title": "阿尔伯特·爱因斯坦",
+    "summary": "生于1879年3月14日...卒于1955年4月18日...",
+    "url": "https://zh.wikipedia.org/..." }
+
+// Step 2: Agent 根据百科结果进行精确计算
+[tool_call_started] calculator
+  args: {"expression": "(1955 - 1879)"}
+[tool_call_finished] calculator (elapsed: 4ms)
+  result: {"expression": "(1955 - 1879)", "result": 76}
+
+[assistant_message]
+爱因斯坦出生于1879年3月14日，逝世于1955年4月18日，
+享年 $1955 - 1879 = 76$ 岁。
+\end{lstlisting}
+
+\textbf{思考过程分析：}
+
+此案例展示了 ReAct 范式的核心优势——\textbf{工具调用与推理的交替进行}：
+
+\begin{enumerate}
+  \item \textbf{第一步（Thought）：}
+    模型接收到用户问题后，意识到需要获取爱因斯坦的生卒年份数据，这些数据不在模型训练参数中。模型判断
+    \texttt{wiki\_search}
+    工具是获取此类事实信息的最佳途径，自动构造了搜索参数（query=``Albert Einstein'',
+    lang=``zh''）。
+
+  \item \textbf{第二步（Observation）：} 模型收到 Wikipedia API
+    返回的结构化数据，提取出生日期``1879年3月14日''和逝世日期``1955年4月18日''。
+
+  \item \textbf{第三步（Thought + Action）：}
+    模型根据观察结果进行推理，判断需要精确计算年龄。它选择调用 \texttt{calculator}
+    工具而非自行计算，因为 System Prompt 中``Never invent tool
+    results''的约束使其倾向于使用正式计算工具来避免错误。构造的表达式 \texttt{(1955 -
+    1879)} 格式正确（仅含年份差，未添加复杂的月份计算），体现了 LLM 对工具参数格式的理解。
+
+  \item \textbf{第四步（Observation + Answer）：} 接收计算结果
+    76，结合百科数据中的具体日期信息，组装成包含出生年份、逝世年份、计算表达式和结果的完整回答。
+\end{enumerate}
+
+该案例成功演示了``{语义理解} → {信息检索} → {数据提取} → {精确计算} → {结果汇总}''的完整闭环。
+
+\subsection{实验二：搜索工具容错机制测试}
+
+\textbf{测试目的：} 验证 \texttt{baidu\_search} 工具的模糊匹配回退机制。
+
+\textbf{测试输入与结果：}
+
+\begin{table}[H]
+  \centering
+  \caption{baidu\_search 模糊回退测试结果}
+  \begin{tabular}{@{}lll@{}}
+    \toprule
+    \textbf{原始输入关键词} & \textbf{自动清洗/变体} & \textbf{最终结果} \\
+    \midrule
+    迈克尔杰克逊 出生年份 死亡年份 & 迈克尔杰克逊 $\to$ 迈克尔·杰克逊 & 命中 \\
+    Anthropic 公司 & Anthropic & 未命中 (无词条) \\
+    迈克尔杰克逊 生平信息 出生逝世年份 & 迈克尔杰克逊 $\to$ 迈克尔·杰克逊 & 命中 \\
+    Michael Jackson birth year & 直接命中 (缓存) & 命中 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{分析：} 百度百科 API 要求传入精确词条名。当模型传入包含多余修饰词的长查询时，
+\texttt{extractCoreKeyword()}
+函数自动剥离噪声词，\texttt{generateVariants()} 尝试中圆点变体。
+这使得工具在模型传入次优查询时仍能工作，减少不必要的失败重试轮次，提升了整体任务完成效率。
+
+\subsection{实验三：多 Agent 协作模式验证}
+
+\textbf{输入：} \texttt{/plan 查一下爱因斯坦的出生年份，然后计算他活了多少岁}
+
+\textbf{Planning Agent 输出：}
+
+\begin{lstlisting}[caption={Planning Agent 生成的执行计划}]
+[
+  "查询阿尔伯特·爱因斯坦的生卒年份",
+  "根据生卒年份计算他活了多少岁"
+]
+\end{lstlisting}
+
+\textbf{Execution Agent 执行：}
+\begin{itemize}
+  \item Step 1: 调用 \texttt{wiki\_search("Albert Einstein",
+    "zh")} $\to$ 获取生卒年份
+  \item Step 2: 接收 Step 1 的结果作为上下文，调用
+    \texttt{calculator("1955-1879")} $\to$ 得出 76
+\end{itemize}
+
+\textbf{Summary Agent 汇总输出：} ``爱因斯坦出生于1879年，逝世于1955年，享年76岁。''
+
+\textbf{对比分析：} 多 Agent 模式将任务显式分解为两个阶段——规划阶段确定``需要查什么''和``需要算什么'',
+执行阶段分布完成。对于简单任务，多 Agent 模式的优势不明显（总 LLM 调用次数增加），
+但对于需要 3 个以上独立步骤的复杂任务，显式分解可以显著提高成功率和可解释性。
+
+\newpage
+\section{进阶功能实现}
+
+\subsection{Skills 技能系统}
+
+在 \verb|.agents/<skill-name>/SKILL.md| 下创建技能定义文件，Agent
+根据用户输入自动匹配并激活技能。
+技能支持自定义系统提示词和工具白名单，例如：
+
+\begin{lstlisting}[caption={code-review 技能定义（SKILL.md）}]
+---
+name: code-review
+description: 审查代码、发现 bug、提出改进建议
+allowed-tools: file_read, file_write
+---
+
+你是代码审查专家。审查代码时：
+1. 先理解代码结构和意图
+2. 检查潜在 bug 和边界条件
+3. 将审查结果写入 artifacts/review.md
+\end{lstlisting}
+
+技能匹配采用基于关键词得分的算法（不需要 LLM 调用）：对输入分词后与技能 description
+进行单词重叠计数（单词长度 > 3），技能名称匹配额外 +3 分。用户级和项目级的技能文件均被支持。
+
+\subsection{MCP 协议扩展}
+
+通过 Model Context Protocol 连接外部工具服务器，工具自动注册到 ToolRegistry。
+配置文件（\texttt{.blackpearl/mcp-servers.json}）支持多服务器和自定义环境变量。
+MCP 工具的执行函数代理调用 \texttt{client.callTool()}，与内置工具共享统一的调用接口。
+
+\subsection{独立可执行文件发布}
+
+项目使用 Node.js 26 SEA（Single Executable Application）的
+\texttt{mainFormat: "module"}
+特性，将 TypeScript 源码、运行时及所有纯 JavaScript 依赖打包为独立二进制文件。通过
+GitHub Actions 在三平台（Windows x64、Linux x64、macOS arm64）构建并发布到 Release，
+支持一键安装（\texttt{curl | bash} 或 \texttt{irm | iex}）。
+
+\newpage
+\section{总结与展望}
+
+本项目从零实现了一个完整的教学型 AI Agent 框架，覆盖了 ReAct 决策闭环、多厂商工具调用适配、
+多 Agent 协作、长期记忆与技能系统等核心功能。主要贡献包括：
+
+\begin{enumerate}
+  \item \textbf{手工实现}不依赖 LangChain 等高层框架，所有核心逻辑可追溯、可解释
+  \item 通过 \textbf{Provider Profile + Runner Factory}
+    模式统一适配三种 API 协议（Responses / \\
+    Chat Completions / Anthropic Messages），覆盖五大 LLM 厂商
+  \item 设计了完整的 \textbf{路径安全沙箱}（逃逸检测 + 敏感路径拦截 + 命令黑名单）
+  \item 实现百度百科搜索的 \textbf{模糊匹配回退机制}（关键词清洗 + 变体生成 + fuse.js 缓存）
+  \item 支持 \textbf{SEA 独立可执行文件}打包，降低最终用户的环境门槛
+\end{enumerate}
+
+未来的改进方向包括：
+\begin{itemize}
+  \item 增加 Runner 层的 mock 集成测试，覆盖 tool call → tool
+    result → 继续循环的完整路径
+  \item 将长期记忆从关键词检索升级为基于 Embedding 的语义检索
+  \item 增加 Web UI 的分页和历史记录功能
+  \item 引入人工确认机制（human-in-the-loop）用于文件写入和命令执行
+\end{itemize}
+
+    \end{document}
