@@ -57,11 +57,6 @@ export function InputBox({
       if (disabled) {
         return;
       }
-      // DEBUG: log every keystroke
-      process.stderr.write(
-        `[InputBox] input=${JSON.stringify(input)} backspace=${key.backspace} ` +
-        `delete=${key.delete} value="${state.value}" cursor=${state.cursorPos} disabled=${disabled}\n`,
-      );
 
       if (key.return) {
         submitCurrentValue();
@@ -136,8 +131,7 @@ export function InputBox({
 
       // ── Delete operations ──────────────────────────
 
-      // Some terminals send BS/DEL as input characters without setting
-      // key.backspace/delete.  Catch those by raw input bytes too.
+      // Backspace: delete character before cursor
       if (key.backspace || input === "\x08" || input === "\x7f") {
         setState((prev) => {
           if (prev.cursorPos === 0) return prev;
@@ -149,13 +143,25 @@ export function InputBox({
         return;
       }
 
+      // Delete / Del key: delete character before cursor when at end
+      // (many terminals map Backspace → Delete), otherwise delete after.
       if (key.delete || input === "\x1b[3~") {
         setState((prev) => {
-          if (prev.cursorPos >= prev.value.length) return prev;
-          return {
-            value: prev.value.slice(0, prev.cursorPos) + prev.value.slice(prev.cursorPos + 1),
-            cursorPos: prev.cursorPos,
-          };
+          // At end of line → act like backspace (delete before cursor)
+          if (prev.cursorPos === prev.value.length && prev.cursorPos > 0) {
+            return {
+              value: prev.value.slice(0, prev.cursorPos - 1) + prev.value.slice(prev.cursorPos),
+              cursorPos: prev.cursorPos - 1,
+            };
+          }
+          // Otherwise → delete after cursor
+          if (prev.cursorPos < prev.value.length) {
+            return {
+              value: prev.value.slice(0, prev.cursorPos) + prev.value.slice(prev.cursorPos + 1),
+              cursorPos: prev.cursorPos,
+            };
+          }
+          return prev;
         });
         return;
       }
