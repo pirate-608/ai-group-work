@@ -57,6 +57,11 @@ export function InputBox({
       if (disabled) {
         return;
       }
+      // DEBUG: log every keystroke
+      process.stderr.write(
+        `[InputBox] input=${JSON.stringify(input)} backspace=${key.backspace} ` +
+        `delete=${key.delete} value="${state.value}" cursor=${state.cursorPos} disabled=${disabled}\n`,
+      );
 
       if (key.return) {
         submitCurrentValue();
