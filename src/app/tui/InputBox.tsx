@@ -136,7 +136,9 @@ export function InputBox({
 
       // ── Delete operations ──────────────────────────
 
-      if (key.backspace) {
+      // Some terminals send BS/DEL as input characters without setting
+      // key.backspace/delete.  Catch those by raw input bytes too.
+      if (key.backspace || input === "\x08" || input === "\x7f") {
         setState((prev) => {
           if (prev.cursorPos === 0) return prev;
           return {
@@ -147,7 +149,7 @@ export function InputBox({
         return;
       }
 
-      if (key.delete) {
+      if (key.delete || input === "\x1b[3~") {
         setState((prev) => {
           if (prev.cursorPos >= prev.value.length) return prev;
           return {
@@ -160,7 +162,8 @@ export function InputBox({
 
       // ── Regular text input ─────────────────────────
 
-      if (!key.ctrl && !key.meta && input) {
+      // Only accept printable characters (skip control chars / escape sequences)
+      if (!key.ctrl && !key.meta && input && !/[\x00-\x1f\x7f]/.test(input) && input.charAt(0) !== "\x1b") {
         setState((prev) => {
           const chars = input;
           return {
